@@ -1,0 +1,9 @@
+[package]
+name = "resource-leak-investigation"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+ezpdb = { version = "0.6.0", path = "../pdbview/crates/ezpdb" }
+kdmp-parser = "0.8.2"
