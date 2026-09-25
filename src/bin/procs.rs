@@ -258,9 +258,151 @@ fn main() -> Result<()> {
         }
     }
     if let Some(pid) = std::env::args().nth(2).map(|s| s.parse::<u64>()).transpose()? {
-        key_report(&mut cx, &nt, procs.iter().find(|p| p.pid == pid && !p.exited).context("pid")?)?;
+        let p = procs.iter().find(|p| p.pid == pid && !p.exited).context("pid")?;
+        key_report(&mut cx, &nt, p)?;
+        thread_report(&mut cx, &nt, &parser, p)?;
     }
     let watchman_pid = procs.iter().find(|p| p.name == "watchman.exe" && !p.exited).map(|p| p.pid);
+    let mut live_commit = 0u64;
+    let mut exited_commit = 0u64;
+    let mut top: Vec<(u64, &Proc)> = Vec::new();
+    for p in &procs {
+        let c = cx.q(p.eprocess + commit).unwrap_or(0);
+        if p.exited {
+            exited_commit += c;
+        } else {
+            live_commit += c;
+        }
+        top.push((c, p));
+    }
+    top.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let mut hist: BTreeMap<u64, usize> = BTreeMap::new();
+    for (c, p) in &top {
+        if p.exited {
+            *hist.entry(*c).or_default() += 1;
+        }
+    }
+    let mut hv: Vec<_> = hist.into_iter().collect();
+    hv.sort_by_key(|x| std::cmp::Reverse(x.1));
+    println!("\nexited process commit (pages: count): {:?}", &hv[..hv.len().min(12)]);
+    println!("\nprivate commit: live {} MiB, exited {} MiB", live_commit * 4 / 1024, exited_commit * 4 / 1024);
+    for (c, p) in top.iter().take(20) {
+        println!("  {:>8} MiB pid {:>6} {}{}", c * 4 / 1024, p.pid, p.name, if p.exited { " (exited)" } else { "" });
+    }
+    let dtb_off = nt.field("_KPROCESS", "DirectoryTableBase")?;
+    let udtb_off = nt.field("_KPROCESS", "UserDirectoryTableBase")?;
+    let ws_off = nt.field(e, "Vm")? + nt.field("_MMSUPPORT_INSTANCE", "WorkingSetSize")?;
+    let phys = kdmp_parser::phys::Reader::new(&parser);
+    // Counts page table pages reachable from the user half of a PML4.
+    let count_tables = |pml4: u64| -> Option<(u64, u64)> {
+        let mut tables = 1u64;
+        let mut leaves = 0u64;
+        let read = |pa: u64| -> Option<[u64; 512]> {
+            let mut b = [0u8; 4096];
+            phys.read_exact(kdmp_parser::gxa::Gpa::new(pa & 0x000f_ffff_ffff_f000), &mut b).ok()?;
+            let mut out = [0u64; 512];
+            for (i, c) in b.chunks_exact(8).enumerate() {
+                out[i] = u64::from_le_bytes(c.try_into().unwrap());
+            }
+            Some(out)
+        };
+        let l4 = read(pml4)?;
+        for &e4 in l4[..256].iter().filter(|e| *e & 1 != 0) {
+            tables += 1;
+            let Some(l3) = read(e4) else { continue };
+            for &e3 in l3.iter().filter(|e| *e & 1 != 0 && *e & 0x80 == 0) {
+                tables += 1;
+                let Some(l2) = read(e3) else { continue };
+                for &e2 in l2.iter().filter(|e| *e & 1 != 0 && *e & 0x80 == 0) {
+                    tables += 1;
+                    if let Some(l1) = read(e2) {
+                        leaves += l1.iter().filter(|e| *e & 1 != 0).count() as u64;
+                    }
+                }
+            }
+        }
+        Some((tables, leaves))
+    };
+    let read_pml4 = |pa: u64| -> Option<Vec<u64>> {
+        let mut b = [0u8; 4096];
+        phys.read_exact(kdmp_parser::gxa::Gpa::new(pa & 0x000f_ffff_ffff_f000), &mut b).ok()?;
+        Some(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    let sys = procs.iter().find(|p| p.pid == 4).context("System")?;
+    let sys_l4 = read_pml4(cx.q(sys.eprocess + dtb_off).unwrap_or(0)).context("system pml4")?;
+    // Counts all pages in the page table subtrees under kernel-half PML4 entries that differ from System's.
+    let private_kernel = |pml4: u64| -> Option<(u64, Vec<usize>)> {
+        let l4 = read_pml4(pml4)?;
+        let mut pages = 0u64;
+        let mut idx = Vec::new();
+        for i in 256..512 {
+            if l4[i] & 1 == 0 || (l4[i] & 0x000f_ffff_ffff_f000) == (sys_l4[i] & 0x000f_ffff_ffff_f000) {
+                continue;
+            }
+            // Self-map entry points back at the PML4 itself.
+            if (l4[i] & 0x000f_ffff_ffff_f000) == (pml4 & 0x000f_ffff_ffff_f000) {
+                continue;
+            }
+            idx.push(i);
+            pages += 1;
+            let Some(l3) = read_pml4(l4[i]) else { continue };
+            for &e3 in l3.iter().filter(|e| *e & 1 != 0 && *e & 0x80 == 0) {
+                pages += 1;
+                let Some(l2) = read_pml4(e3) else { continue };
+                for &e2 in l2.iter().filter(|e| *e & 1 != 0 && *e & 0x80 == 0) {
+                    pages += 1;
+                    if let Some(l1) = read_pml4(e2) {
+                        pages += l1.iter().filter(|e| *e & 1 != 0).count() as u64;
+                    }
+                }
+            }
+        }
+        Some((pages, idx))
+    };
+    let mut zk = 0u64;
+    for (i, p) in exited.iter().enumerate() {
+        if let Some((n, idx)) = private_kernel(cx.q(p.eprocess + dtb_off).unwrap_or(0)) {
+            zk += n;
+            if i < 3 {
+                println!("zombie pid {} eprocess {:#x} private kernel-half pages {n} at pml4 index {idx:?}", p.pid, p.eprocess);
+            }
+        }
+    }
+    println!("zombie private kernel-half pages total {zk} ({} MiB)", zk * 4 / 1024);
+    let (mut zt, mut zl, mut zw, mut zu, mut zn) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for (i, p) in exited.iter().enumerate() {
+        let dtb = cx.q(p.eprocess + dtb_off).unwrap_or(0);
+        let udtb = cx.q(p.eprocess + udtb_off).unwrap_or(0);
+        let ws = cx.q(p.eprocess + ws_off).unwrap_or(0);
+        if let Some((t, l)) = count_tables(dtb) {
+            zt += t;
+            zl += l;
+            zn += 1;
+        }
+        zw += ws;
+        if udtb > 1 && udtb != dtb {
+            zu += 1;
+        }
+        if i < 3 {
+            println!("zombie pid {} dtb {dtb:#x} udtb {udtb:#x} ws {ws} tables/leaves {:?}", p.pid, count_tables(dtb));
+        }
+    }
+    println!("zombies walked {zn}: table pages {zt}, mapped user pages {zl}, working set pages {zw}, with separate user dtb {zu}");
+    let pws_off = nt.field(e, "Vm")? + nt.field("_MMSUPPORT_INSTANCE", "WorkingSetPrivateSize")?;
+    let (mut tws, mut tpws) = (0u64, 0u64);
+    let mut ws_top: Vec<(u64, u64, &Proc)> = Vec::new();
+    for p in procs.iter().filter(|p| !p.exited) {
+        let ws = cx.q(p.eprocess + ws_off).unwrap_or(0);
+        let pws = cx.q(p.eprocess + pws_off).unwrap_or(0);
+        tws += ws;
+        tpws += pws;
+        ws_top.push((pws, ws, p));
+    }
+    ws_top.sort_by_key(|x| std::cmp::Reverse(x.0));
+    println!("\nlive process working sets: private {} MiB, total {} MiB", tpws * 4 / 1024, tws * 4 / 1024);
+    for (pws, ws, p) in ws_top.iter().take(10) {
+        println!("  private {:>7} MiB total {:>7} MiB pid {:>6} {}", pws * 4 / 1024, ws * 4 / 1024, p.pid, p.name);
+    }
     let mut cmd: Vec<&Proc> = exited.iter().copied().filter(|p| Some(p.ppid) == watchman_pid).collect();
     cmd.sort_by_key(|p| p.create_time);
     if let (Some(a), Some(b)) = (cmd.first(), cmd.last()) {
@@ -335,6 +477,94 @@ fn key_report(cx: &mut Ctx, nt: &Module, p: &Proc) -> Result<()> {
     }
     for (h, kcb) in first {
         println!("  first handles: {h:#x} {}", full(cx, kcb));
+    }
+    Ok(())
+}
+
+/// Thread states, wait reasons and a heuristic kernel stack scan for a process.
+fn thread_report(cx: &mut Ctx, nt: &Module, parser: &KernelDumpParser, p: &Proc) -> Result<()> {
+    let k = "_KTHREAD";
+    let head = p.eprocess + nt.field("_KPROCESS", "ThreadListHead")?;
+    let entry = nt.field(k, "ThreadListEntry")?;
+    let state = nt.field(k, "State")?;
+    let reason = nt.field(k, "WaitReason")?;
+    let wait_time = nt.field(k, "WaitTime")?;
+    let ktime = nt.field(k, "KernelTime")?;
+    let utime = nt.field(k, "UserTime")?;
+    let kstack = nt.field(k, "KernelStack")?;
+    let istack = nt.field(k, "InitialStack")?;
+    let wbl = nt.field(k, "WaitBlockList")?;
+    let cid = nt.field("_ETHREAD", "Cid")?;
+    let start = nt.field("_ETHREAD", "Win32StartAddress")?;
+    let d = |cx: &Ctx, a: u64| cx.r.try_read_struct::<u32>(Gva::new(a)).ok().flatten().unwrap_or(0);
+    // KUSER_SHARED_DATA.TickCountQuad.
+    let now = cx.q(0xfffff780_00000320).unwrap_or(0);
+    let mods: Vec<(u64, u64, String)> = parser
+        .kernel_modules()
+        .map(|(r, n)| (u64::from(r.start), u64::from(r.end), n.rsplit('\\').next().unwrap_or(n).to_owned()))
+        .collect();
+    let mut procs_by_addr: Vec<(u64, u64, &str)> =
+        nt.pdb.procedures.iter().filter_map(|f| Some((f.address? as u64, f.len as u64, f.name.as_str()))).collect();
+    procs_by_addr.sort();
+    let sym = |a: u64| -> Option<String> {
+        let i = procs_by_addr.partition_point(|x| x.0 <= a);
+        if i > 0 {
+            let (b, l, n) = procs_by_addr[i - 1];
+            if a < b + l {
+                return Some(format!("nt!{n}+{:#x}", a - b));
+            }
+        }
+        mods.iter().find(|m| a >= m.0 && a < m.1 && !m.2.eq_ignore_ascii_case("ntoskrnl.exe")).map(|m| format!("{}+{:#x}", m.2, a - m.0))
+    };
+    println!("\nthreads of pid {} (tick now {now}):", p.pid);
+    let mut cur = cx.q(head).unwrap_or(head);
+    while cur != head && cur != 0 {
+        let t = cur - entry;
+        let st = cx.r.try_read_struct::<u32>(Gva::new(t + state)).ok().flatten().unwrap_or(0) as u8;
+        let wr = (cx.r.try_read_struct::<u32>(Gva::new(t + reason - 3)).ok().flatten().unwrap_or(0) >> 24) as u8;
+        let wt = d(cx, t + wait_time) as u64;
+        println!(
+            "  tid {} state {} waitreason {} waiting {}s kernel {}s user {}s start {:#x}",
+            cx.q(t + cid + 8).unwrap_or(0),
+            st,
+            wr,
+            if st == 5 { (now.saturating_sub(wt) as f64 * 0.015625) as u64 } else { 0 },
+            (d(cx, t + ktime) as f64 * 0.015625) as u64,
+            (d(cx, t + utime) as f64 * 0.015625) as u64,
+            cx.q(t + start).unwrap_or(0)
+        );
+        if st == 5 {
+            let mut wb = cx.q(t + wbl).unwrap_or(0);
+            for _ in 0..4 {
+                if wb == 0 {
+                    break;
+                }
+                let obj = cx.q(wb + 0x20).unwrap_or(0);
+                let ty = cx.type_name(obj - cx.off.body).unwrap_or_else(|| "?".into());
+                println!("    waits on {obj:#x} {ty}");
+                let next = cx.q(wb).unwrap_or(0);
+                if next == wb || next == 0 {
+                    break;
+                }
+                wb = next;
+                break;
+            }
+        }
+        let (lo, hi) = (cx.q(t + kstack).unwrap_or(0), cx.q(t + istack).unwrap_or(0));
+        if lo != 0 && hi > lo && hi - lo < 0x10000 {
+            let mut buf = vec![0u8; (hi - lo) as usize];
+            if cx.r.try_read_exact(Gva::new(lo), &mut buf).ok().flatten().is_some() {
+                let frames: Vec<String> = buf
+                    .chunks_exact(8)
+                    .filter_map(|c| sym(u64::from_le_bytes(c.try_into().unwrap())))
+                    .take(25)
+                    .collect();
+                for f in frames {
+                    println!("      {f}");
+                }
+            }
+        }
+        cur = cx.q(cur).unwrap_or(0);
     }
     Ok(())
 }
